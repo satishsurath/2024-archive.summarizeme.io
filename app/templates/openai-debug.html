@@ -1,7 +1,9 @@
 {% extends "base.html" %}
 
 {% block content %}
-    <h1>openAI-debug</h1>
+    <h1>Ollama Debug</h1>
+    <p><strong>Endpoint:</strong> {{ openai_host }}</p>
+    <p><strong>Model:</strong> {{ openai_model }}</p>
     <form action="" method="post" novalidate>
         {{ form.hidden_tag() }}
         <p>

@@ -1,13 +1,13 @@
 import os
-#import openai
 import json
+import re
 import trafilatura
 import tiktoken
 import nltk
 import time
 import random
 import hashlib
-import promptlayer
+import requests
 import rollbar
 from nltk.tokenize import sent_tokenize
 from app import app, db, login_manager, linkedin_bp
@@ -114,9 +114,26 @@ def request_loader(request):
 # -------------------- Flask app configurations --------------------
 app.jinja_env.filters['nl2br'] = nl2br
 
-promptlayer.api_key = os.getenv("PROMPTLAYER_API_KEY")
-openai = promptlayer.openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
+OLLAMA_BASE_URL = (os.getenv("OLLAMA_BASE_URL") or app.config.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL_OVERRIDE = os.getenv("OLLAMA_MODEL") or app.config.get("OLLAMA_MODEL")
+OLLAMA_MODEL_PREFERENCE = (
+    os.getenv("OLLAMA_MODEL_PREFERENCE")
+    or app.config.get("OLLAMA_MODEL_PREFERENCE")
+    or "llama3.1,llama3,qwen2,mistral,gemma,phi3,phi"
+)
+OLLAMA_PREFERRED_MODELS = [model.strip() for model in OLLAMA_MODEL_PREFERENCE.split(",") if model.strip()]
+OLLAMA_TIMEOUT_SECONDS = 120
+try:
+    _cfg_timeout = os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS") or os.getenv("OLLAMA_REQUEST_TIMEOUT")
+    if _cfg_timeout is None:
+        _cfg_timeout = app.config.get("OLLAMA_REQUEST_TIMEOUT")
+    if _cfg_timeout is not None:
+        OLLAMA_TIMEOUT_SECONDS = int(_cfg_timeout)
+except (TypeError, ValueError):
+    app.logger.warning("Invalid OLLAMA timeout value. Defaulting to 120 seconds.")
+if OLLAMA_TIMEOUT_SECONDS <= 0:
+    OLLAMA_TIMEOUT_SECONDS = 120
+resolved_ollama_model = None
 
 
 nltk.download('punkt')
@@ -132,6 +149,182 @@ global_form_prompt = ""
 global_number_of_chunks = 0
 content_written = False
 global_pdf_filename = ""
+_ollama_models_cache = None
+
+
+def _safe_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ollama_request_timeout():
+    return _safe_int(os.getenv("OLLAMA_TIMEOUT_SECONDS"), OLLAMA_TIMEOUT_SECONDS)
+
+
+def _ollama_api_url(path):
+    return f"{OLLAMA_BASE_URL}{path}"
+
+
+def _ollama_api_request(method, path, payload=None):
+    response = requests.request(
+        method=method,
+        url=_ollama_api_url(path),
+        json=payload,
+        timeout=_ollama_request_timeout()
+    )
+    if not response.ok:
+        raise RuntimeError(f"Ollama API returned {response.status_code}: {response.text}")
+    return response.json()
+
+
+def _safe_request_error(error, context):
+    app.logger.error(f"{context}: {error}")
+
+
+def _get_local_ollama_models():
+    global _ollama_models_cache
+    if _ollama_models_cache is not None:
+        return _ollama_models_cache
+
+    try:
+        response = _ollama_api_request("GET", "/api/tags")
+        models = response.get("models") if isinstance(response, dict) else []
+        if not isinstance(models, list):
+            models = []
+        _ollama_models_cache = [model for model in models if isinstance(model, dict) and model.get("name")]
+    except Exception as e:
+        _safe_request_error(e, "Failed to query local Ollama models")
+        _ollama_models_cache = []
+
+    return _ollama_models_cache
+
+
+def _extract_model_parameter_size(model_name, model_details):
+    if not isinstance(model_name, str):
+        return 0.0
+
+    candidates = []
+    if isinstance(model_details, dict) and isinstance(model_details.get("parameter_size"), str):
+        candidates.append(model_details.get("parameter_size"))
+    candidates.append(model_name)
+
+    for candidate in candidates:
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:b|B)", candidate)
+        if match:
+            return _safe_float(match.group(1), 0.0)
+    return 0.0
+
+
+def _model_sort_key(model):
+    name = (model.get("name") or "").lower()
+    details = model.get("details") if isinstance(model, dict) else {}
+    preferred_rank = 0
+    for index, prefix in enumerate(OLLAMA_PREFERRED_MODELS):
+        if prefix.lower() in name:
+            preferred_rank = len(OLLAMA_PREFERRED_MODELS) - index
+            break
+    file_size = _safe_int(model.get("size", 0), 0)
+    return (
+        preferred_rank,
+        _extract_model_parameter_size(name, details),
+        file_size
+    )
+
+
+def get_ollama_model(override_model=None):
+    global resolved_ollama_model
+    if override_model and override_model.strip():
+        return override_model.strip()
+    if resolved_ollama_model:
+        return resolved_ollama_model
+    if OLLAMA_MODEL_OVERRIDE and OLLAMA_MODEL_OVERRIDE.strip():
+        resolved_ollama_model = OLLAMA_MODEL_OVERRIDE.strip()
+        return resolved_ollama_model
+
+    available_models = _get_local_ollama_models()
+    if not available_models:
+        raise RuntimeError("No Ollama models found locally. Run `ollama pull` to install one.")
+    selected_model = sorted(available_models, key=_model_sort_key, reverse=True)[0]
+    resolved_ollama_model = selected_model["name"]
+    app.logger.info("Auto-selected Ollama model: %s", resolved_ollama_model)
+    return resolved_ollama_model
+
+
+def _openai_like_response(raw_response, model):
+    if not isinstance(raw_response, dict):
+        raise RuntimeError("Ollama returned an invalid response format.")
+
+    if raw_response.get("message"):
+        content = raw_response["message"].get("content", "")
+    else:
+        content = raw_response.get("response", "")
+    if not isinstance(content, str):
+        content = str(content)
+    if not content:
+        raise RuntimeError("Ollama returned an empty response.")
+
+    prompt_tokens = _safe_int(raw_response.get("prompt_eval_count"), 0)
+    completion_tokens = _safe_int(raw_response.get("eval_count"), 0)
+    return {
+        "id": f"ollama-{model}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    }
+
+
+def _call_ollama_completion(messages, max_tokens=1000, temperature=0.7, model_override=None):
+    model = get_ollama_model(model_override)
+    options = {
+        "num_predict": _safe_int(max_tokens, 1000),
+        "temperature": _safe_float(temperature, 0.7)
+    }
+
+    chat_payload = {
+        "model": model,
+        "stream": False,
+        "messages": messages,
+        "options": options
+    }
+    try:
+        raw_response = _ollama_api_request("POST", "/api/chat", chat_payload)
+        return _openai_like_response(raw_response, model)
+    except RuntimeError as first_error:
+        _safe_request_error(first_error, "Falling back to Ollama /api/generate")
+        prompt = "\n".join([msg.get("content", "") for msg in messages if isinstance(msg, dict)]).strip()
+        generate_payload = {
+            "model": model,
+            "stream": False,
+            "prompt": prompt,
+            "options": options
+        }
+        raw_response = _ollama_api_request("POST", "/api/generate", generate_payload)
+        return _openai_like_response(raw_response, model)
+
+
+def _ollama_moderation_placeholder(form_prompt):
+    return {"results": [{"flagged": False}]}
 
 
 # -------------------- Routes --------------------
@@ -1573,6 +1766,7 @@ def openAI_debug():
     form = openAI_debug_form()
     global openAI_summary
     global text2summarize
+    active_model = resolved_ollama_model or OLLAMA_MODEL_OVERRIDE or "Auto-selected local model"
     if form.validate_on_submit():
       openai_api_form_prompt = form.openAI_debug_form_prompt.data
       openai_api_form_key = form.openAI_debug_form_key.data
@@ -1581,9 +1775,26 @@ def openAI_debug():
       return redirect(url_for('openAI_debug'))
     if (openAI_summary):
       openAI_summary_str = json.dumps(openAI_summary, indent=4)
-      return render_template('openai-debug.html', title='openAI-debug', form=form,openai_key = os.getenv("OPENAI_API_KEY"), text2summarize=text2summarize, openAI_summary=openAI_summary_str, just_summary = openAI_summary["choices"][0]['message']['content'] )
+      return render_template(
+          'openai-debug.html',
+          title='openAI-debug',
+          form=form,
+          openai_key=active_model,
+          openai_host=OLLAMA_BASE_URL,
+          openai_model=active_model,
+          text2summarize=text2summarize,
+          openAI_summary=openAI_summary_str,
+          just_summary = openAI_summary["choices"][0]['message']['content']
+      )
     else:
-        return render_template('openai-debug.html', title='openAI-debug', form=form, openai_key = os.getenv("OPENAI_API_KEY"))
+        return render_template(
+            'openai-debug.html',
+            title='openAI-debug',
+            form=form,
+            openai_key=active_model,
+            openai_host=OLLAMA_BASE_URL,
+            openai_model=active_model
+        )
 
 @app.route("/signin", methods=['GET', 'POST'])
 def signin():
@@ -1619,18 +1830,13 @@ def signout():
 # -------------------- OpenAI API Functions --------------------
 
 def openAI_summarize_debug(form_openai_key, form_prompt):
-    openai.api_key = form_openai_key
-    message = {"role": "user", "content": form_prompt}
-    response = openai.ChatCompletion.create(
-      model="gpt-3.5-turbo",
-      messages=[message],
-      temperature=0.7,
-      max_tokens=2000,
-      top_p=1.0,
-      frequency_penalty=0.0,
-      presence_penalty=1
-      )
-    print(json.dumps(response, indent=4)) 
+    response = _call_ollama_completion(
+        [{"role": "user", "content": form_prompt}],
+        max_tokens=2000,
+        temperature=0.7,
+        model_override=form_openai_key
+    )
+    print(json.dumps(response, indent=4))
     return response
 
 
@@ -1647,14 +1853,10 @@ def openAI_page_title(form_prompt):
           title_prompt = title_prompt[:4000]
 
       message = {"role": "user", "content": global_prompt + title_prompt}
-      response = openai.ChatCompletion.create(
-          model="gpt-3.5-turbo",
-          messages=[message],
-          temperature=0.7,
+      response = _call_ollama_completion(
+          [message],
           max_tokens=500,
-          top_p=1.0,
-          frequency_penalty=0.0,
-          presence_penalty=1
+          temperature=0.7
       )
       openai_response = response["choices"][0]['message']['content']
       return openai_response
@@ -1669,38 +1871,18 @@ def retry_with_exponential_backoff(func):
         for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
-            except (openai.error.ServiceUnavailableError) as e:
-                error_type = "Rate limit exceeded" if isinstance(e, openai.error.RateLimitError) else "Service unavailable"
-                print(f"{error_type}. Retrying after delay... (Attempt {attempt + 1} of {max_retries})")
-                app.logger.error(f"{error_type}. Retrying after delay... (Attempt {attempt + 1} of {max_retries})")
-                # rollbar.report_message(f'{error_type}. Retrying after delay... {str(e)}', 'warning')
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"LLM call failed after retries: {e}")
+                    app.logger.error(f"LLM call failed after retries: {e}")
+                    break
+                print(f"LLM call failed. Retrying after delay... (Attempt {attempt + 1} of {max_retries})")
+                app.logger.error(f"LLM call failed. Retrying after delay... (Attempt {attempt + 1} of {max_retries})")
+                # rollbar.report_message(f'LLM call failed. Retrying after delay... {str(e)}', 'warning')
                 # rollbar.report_exc_info()
                 time.sleep(retry_delay)
                 # Increase the delay for the next retry with some random jitter
                 retry_delay *= 2 * random.uniform(0.8, 1.2)
-            except (openai.error.RateLimitError) as e:
-                error_type = "Rate limit exceeded" if isinstance(e, openai.error.RateLimitError) else "Service unavailable"
-                app.logger.error(f"{error_type}. Retrying after delay... (Attempt {attempt + 1} of {max_retries})")
-                print(f"{error_type}. Retrying after delay... (Attempt {attempt + 1} of {max_retries})")
-                # rollbar.report_message(f'{error_type}. Retrying after delay... {str(e)}', 'warning')
-                # rollbar.report_exc_info()
-                time.sleep(retry_delay)
-                # Increase the delay for the next retry with some random jitter
-                retry_delay *= 2 * random.uniform(0.8, 1.2)                
-            except openai.error.OpenAIError as e:
-                # Handle other OpenAI-specific errors
-                print(f"An OpenAI error occurred: {e}")
-                app.logger.error(f"An OpenAI error occurred: {e}")
-                # rollbar.report_message(f"An OpenAI error occurred: {e}", 'error')
-                # rollbar.report_exc_info()
-                break  # Break out of retry loop for non-retryable errors
-            except Exception as e:
-                # Handle other unforeseen errors
-                print(f"An unexpected error occurred: {e}")
-                app.logger.error(f"An unexpected error occurred: {e}")
-                # rollbar.report_message(f"An unexpected error occurred: {e}", 'error')
-                # rollbar.report_exc_info()
-                break  # Break out of retry loop for non-retryable errors
         raise Exception("API call failed even after retries.")
     return wrapper
 
@@ -1722,9 +1904,8 @@ def openAI_summarize_chunk(form_prompt):
     
     # Step 1: Call the Moderation Endpoint First
     try:
-        moderation_response = openai.Moderation.create(input=form_prompt)
+        moderation_response = _ollama_moderation_placeholder(form_prompt)
         app.logger.info(f"Moderation response: {moderation_response}")
-        print(moderation_response)
     except Exception as e:
         print(f"Moderation API call failed with error: {e}")
         app.logger.error(f"Moderation API call failed with error: {e}")
@@ -1811,15 +1992,7 @@ def openAI_summarize_chunk(form_prompt):
             message = {"role": "user", "content": global_prompt + chunk}
             # Added try-except block for API call
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",#changed from 16k
-                    messages=[message],
-                    temperature=0.7,
-                    max_tokens=1000,
-                    top_p=1.0,
-                    frequency_penalty=0.0,
-                    presence_penalty=1
-                )
+                response = _call_ollama_completion([message], max_tokens=1000, temperature=0.7)
                 app.logger.info(f"API call succeeded with response: {response}")
             except Exception as e:
                 print(f"API call failed with error: {e}")
@@ -1846,15 +2019,7 @@ def openAI_summarize_chunk(form_prompt):
         
         # Added try-except block for API call
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo", #changed from 16k
-                messages=[message],
-                temperature=0.7,
-                max_tokens=1000,
-                top_p=1.0,
-                frequency_penalty=0.0,
-                presence_penalty=1
-            )
+            response = _call_ollama_completion([message], max_tokens=1000, temperature=0.7)
         except Exception as e:
             print(f"API call failed with error: {e}")
             # rollbar.report_message(f"API call failed with error: {e}", 'error')
@@ -1882,7 +2047,7 @@ def openAI_keyInsights_chunk(form_prompt):
     
     # Step 1: Call the Moderation Endpoint First
     try:
-        moderation_response = openai.Moderation.create(input=form_prompt)
+        moderation_response = _ollama_moderation_placeholder(form_prompt)
         print(moderation_response)
     except Exception as e:
         print(f"Moderation API call failed with error: {e}")
@@ -1965,15 +2130,7 @@ def openAI_keyInsights_chunk(form_prompt):
             message = {"role": "user", "content": global_prompt + chunk}
             # Added try-except block for API call
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo", #changing this from 16K to 4K Model
-                    messages=[message],
-                    temperature=0.7,
-                    max_tokens=1000,
-                    top_p=1.0,
-                    frequency_penalty=0.0,
-                    presence_penalty=1
-                )
+                response = _call_ollama_completion([message], max_tokens=1000, temperature=0.7)
             except Exception as e:
                 print(f"API call failed with error: {e}")
                 # rollbar.report_message(f"API call failed with error: {e}", 'error')
@@ -1998,15 +2155,7 @@ def openAI_keyInsights_chunk(form_prompt):
         
         # Added try-except block for API call
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo", #changing this from 16K to 4K Model
-                messages=[message],
-                temperature=0.7,
-                max_tokens=1000,
-                top_p=1.0,
-                frequency_penalty=0.0,
-                presence_penalty=1
-            )
+            response = _call_ollama_completion([message], max_tokens=1000, temperature=0.7)
         except Exception as e:
             print(f"API call failed with error: {e}")
             # rollbar.report_message(f"API call failed with error: {e}", 'error')
@@ -2066,4 +2215,3 @@ def delete_old_logs():
 
 
 scheduler.add_job(id='Delete Old Logs', func=delete_old_logs, trigger='interval', hours=1)
-

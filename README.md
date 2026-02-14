@@ -32,28 +32,35 @@ AI-powered text summarization made simple. Condense articles, web pages, and PDF
    git clone git@github.com:satishsurath/SummarizeMe.io.git
     ```
 
-3. Set up your OpenAI API Key as an environment variable. [Request an API key here.](https://openai.com/blog/openai-api)
+3. Set up Ollama and point the app to your local server (no OpenAI API key is required).
 ```shell
-export OPENAI_API_KEY=[YOUR-OPENAI_API_KEY-HERE]
+export OLLAMA_BASE_URL=http://localhost:11434
+export OLLAMA_MODEL_PREFERENCE="llama3.1,llama3,qwen2,mistral,gemma,phi3,phi"
+# Optional (if you want to pin): export OLLAMA_MODEL=llama3.1
+export OLLAMA_REQUEST_TIMEOUT=120
 ```
-4. Configure your admin username and password for log access:
+4. If you want to persist these values, copy `sample.env` to `.env` and adjust as needed. Set `SQLALCHEMY_DATABASE_URI` for PostgreSQL, for example:
+   ```env
+   SQLALCHEMY_DATABASE_URI=postgresql+psycopg2://<DB_USER>:<DB_PASSWORD>@<DB_HOST>:5432/<DB_NAME>
+   ```
+5. Install a model in Ollama (example: `ollama pull llama3.1`).
+6. Configure your admin username and password for log access:
 ```shell
 export summarizeMeUser=[YOUR ADMIN USERNAME HERE]
 export summarizeMePassword=[YOUR ADMIN PASSWORD HERE]
-```
+``` 
 
-5. Install all Python dependencies in your environment:
+7. Install all Python dependencies in your environment:
 ```shell
 pip install -r requirements.txt
 ```
-6. Initialize the Database 
+8. Initialize the Database 
 ```shell
 flask db init
 flask db migrate -m "entry_post table"
 flask db upgrade
 ```
-7. Congratulations! You are ready to run your Flask App!
+9. Congratulations! You are ready to run your Flask App!
 ```shell
 flask run
 ```
-
